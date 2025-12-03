@@ -1,18 +1,18 @@
 package market
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"nofx/hook"
-	"strconv"
 	"time"
 )
 
 const (
-	baseURL = "https://fapi.binance.com"
+	baseURL = "https://api.hyperliquid.xyz"
 )
 
 type APIClient struct {
@@ -35,39 +35,18 @@ func NewAPIClient() *APIClient {
 	}
 }
 
-func (c *APIClient) GetExchangeInfo() (*ExchangeInfo, error) {
-	url := fmt.Sprintf("%s/fapi/v1/exchangeInfo", baseURL)
-	resp, err := c.client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var exchangeInfo ExchangeInfo
-	err = json.Unmarshal(body, &exchangeInfo)
+// postInfo 发送POST请求到Hyperliquid info端点
+func (c *APIClient) postInfo(requestBody interface{}) ([]byte, error) {
+	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, err
 	}
 
-	return &exchangeInfo, nil
-}
-
-func (c *APIClient) GetKlines(symbol, interval string, limit int) ([]Kline, error) {
-	url := fmt.Sprintf("%s/fapi/v1/klines", baseURL)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("POST", baseURL+"/info", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, err
 	}
-
-	q := req.URL.Query()
-	q.Add("symbol", symbol)
-	q.Add("interval", interval)
-	q.Add("limit", strconv.Itoa(limit))
-	req.URL.RawQuery = q.Encode()
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -80,81 +59,219 @@ func (c *APIClient) GetKlines(symbol, interval string, limit int) ([]Kline, erro
 		return nil, err
 	}
 
-	var klineResponses []KlineResponse
-	err = json.Unmarshal(body, &klineResponses)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API返回状态码 %d: %s", resp.StatusCode, string(body))
+	}
+
+	return body, nil
+}
+
+func (c *APIClient) GetExchangeInfo() (*ExchangeInfo, error) {
+	// Hyperliquid使用metaAndAssetCtxs获取交易对信息
+	reqBody := map[string]string{"type": "metaAndAssetCtxs"}
+	body, err := c.postInfo(reqBody)
 	if err != nil {
+		return nil, err
+	}
+
+	// Hyperliquid返回的是一个数组 [meta, assetCtxs]
+	var result []json.RawMessage
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	if len(result) < 2 {
+		return nil, fmt.Errorf("无效的metaAndAssetCtxs响应")
+	}
+
+	// 解析meta部分获取universe
+	var meta struct {
+		Universe []struct {
+			Name        string `json:"name"`
+			SzDecimals  int    `json:"szDecimals"`
+			MaxLeverage int    `json:"maxLeverage"`
+			IsDelisted  bool   `json:"isDelisted,omitempty"`
+		} `json:"universe"`
+	}
+	if err := json.Unmarshal(result[0], &meta); err != nil {
+		return nil, err
+	}
+
+	// 转换为ExchangeInfo格式
+	exchangeInfo := &ExchangeInfo{
+		Symbols: make([]SymbolInfo, 0, len(meta.Universe)),
+	}
+
+	for _, asset := range meta.Universe {
+		if asset.IsDelisted {
+			continue
+		}
+		exchangeInfo.Symbols = append(exchangeInfo.Symbols, SymbolInfo{
+			Symbol:            asset.Name,
+			Status:            "TRADING",
+			BaseAsset:         asset.Name,
+			QuoteAsset:        "USD",
+			ContractType:      "PERPETUAL",
+			PricePrecision:    8,
+			QuantityPrecision: asset.SzDecimals,
+		})
+	}
+
+	return exchangeInfo, nil
+}
+
+func (c *APIClient) GetKlines(symbol, interval string, limit int) ([]Kline, error) {
+	// Hyperliquid需要计算startTime和endTime
+	// 根据interval计算时间范围
+	intervalDuration := getIntervalDuration(interval)
+	endTime := time.Now().UnixMilli()
+	startTime := endTime - int64(limit)*intervalDuration.Milliseconds()
+
+	// 标准化symbol (去掉USDT后缀)
+	coin := NormalizeCoin(symbol)
+
+	reqBody := map[string]interface{}{
+		"type":      "candleSnapshot",
+		"req": map[string]interface{}{
+			"coin":      coin,
+			"interval":  interval,
+			"startTime": startTime,
+			"endTime":   endTime,
+		},
+	}
+
+	body, err := c.postInfo(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	// Hyperliquid返回K线数组
+	var hlKlines []HyperliquidCandle
+	if err := json.Unmarshal(body, &hlKlines); err != nil {
 		log.Printf("获取K线数据失败,响应内容: %s", string(body))
 		return nil, err
 	}
 
-	var klines []Kline
-	for _, kr := range klineResponses {
-		kline, err := parseKline(kr)
-		if err != nil {
-			log.Printf("解析K线数据失败: %v", err)
-			continue
-		}
+	klines := make([]Kline, 0, len(hlKlines))
+	for _, hlk := range hlKlines {
+		kline := parseHyperliquidCandle(hlk)
 		klines = append(klines, kline)
 	}
 
 	return klines, nil
 }
 
-func parseKline(kr KlineResponse) (Kline, error) {
-	var kline Kline
+// HyperliquidCandle Hyperliquid K线数据结构
+type HyperliquidCandle struct {
+	T int64   `json:"t"` // 开盘时间(毫秒)
+	T2 int64  `json:"T"` // 收盘时间(毫秒)
+	S string  `json:"s"` // 交易对
+	I string  `json:"i"` // 时间间隔
+	O string  `json:"o"` // 开盘价
+	C string  `json:"c"` // 收盘价
+	H string  `json:"h"` // 最高价
+	L string  `json:"l"` // 最低价
+	V string  `json:"v"` // 成交量
+	N int     `json:"n"` // 交易数量
+}
 
-	if len(kr) < 11 {
-		return kline, fmt.Errorf("invalid kline data")
+func parseHyperliquidCandle(hlk HyperliquidCandle) Kline {
+	open, _ := parseFloat(hlk.O)
+	high, _ := parseFloat(hlk.H)
+	low, _ := parseFloat(hlk.L)
+	closePrice, _ := parseFloat(hlk.C)
+	volume, _ := parseFloat(hlk.V)
+
+	return Kline{
+		OpenTime:  hlk.T,
+		CloseTime: hlk.T2,
+		Open:      open,
+		High:      high,
+		Low:       low,
+		Close:     closePrice,
+		Volume:    volume,
+		Trades:    hlk.N,
 	}
+}
 
-	// 解析各个字段
-	kline.OpenTime = int64(kr[0].(float64))
-	kline.Open, _ = strconv.ParseFloat(kr[1].(string), 64)
-	kline.High, _ = strconv.ParseFloat(kr[2].(string), 64)
-	kline.Low, _ = strconv.ParseFloat(kr[3].(string), 64)
-	kline.Close, _ = strconv.ParseFloat(kr[4].(string), 64)
-	kline.Volume, _ = strconv.ParseFloat(kr[5].(string), 64)
-	kline.CloseTime = int64(kr[6].(float64))
-	kline.QuoteVolume, _ = strconv.ParseFloat(kr[7].(string), 64)
-	kline.Trades = int(kr[8].(float64))
-	kline.TakerBuyBaseVolume, _ = strconv.ParseFloat(kr[9].(string), 64)
-	kline.TakerBuyQuoteVolume, _ = strconv.ParseFloat(kr[10].(string), 64)
+func getIntervalDuration(interval string) time.Duration {
+	switch interval {
+	case "1m":
+		return time.Minute
+	case "3m":
+		return 3 * time.Minute
+	case "5m":
+		return 5 * time.Minute
+	case "15m":
+		return 15 * time.Minute
+	case "30m":
+		return 30 * time.Minute
+	case "1h":
+		return time.Hour
+	case "2h":
+		return 2 * time.Hour
+	case "4h":
+		return 4 * time.Hour
+	case "8h":
+		return 8 * time.Hour
+	case "12h":
+		return 12 * time.Hour
+	case "1d":
+		return 24 * time.Hour
+	default:
+		return time.Hour
+	}
+}
 
-	return kline, nil
+// NormalizeCoin 标准化币种名称 (去掉USDT后缀，Hyperliquid使用纯币种名称)
+func NormalizeCoin(symbol string) string {
+	symbol = Normalize(symbol) // 先标准化为大写+USDT
+	if len(symbol) > 4 && symbol[len(symbol)-4:] == "USDT" {
+		return symbol[:len(symbol)-4]
+	}
+	return symbol
 }
 
 func (c *APIClient) GetCurrentPrice(symbol string) (float64, error) {
-	url := fmt.Sprintf("%s/fapi/v1/ticker/price", baseURL)
-	req, err := http.NewRequest("GET", url, nil)
+	// 使用allMids获取所有中间价
+	reqBody := map[string]string{"type": "allMids"}
+	body, err := c.postInfo(reqBody)
 	if err != nil {
 		return 0, err
 	}
 
-	q := req.URL.Query()
-	q.Add("symbol", symbol)
-	req.URL.RawQuery = q.Encode()
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	// 返回格式: {"BTC": "50000.5", "ETH": "3000.2", ...}
+	var mids map[string]string
+	if err := json.Unmarshal(body, &mids); err != nil {
 		return 0, err
 	}
 
-	var ticker PriceTicker
-	err = json.Unmarshal(body, &ticker)
-	if err != nil {
-		return 0, err
+	coin := NormalizeCoin(symbol)
+	priceStr, exists := mids[coin]
+	if !exists {
+		return 0, fmt.Errorf("未找到 %s 的价格", coin)
 	}
 
-	price, err := strconv.ParseFloat(ticker.Price, 64)
+	price, err := parseFloat(priceStr)
 	if err != nil {
 		return 0, err
 	}
 
 	return price, nil
+}
+
+// GetMetaAndAssetCtxs 获取元数据和资产上下文（包含OI、资金费率等）
+func (c *APIClient) GetMetaAndAssetCtxs() ([]json.RawMessage, error) {
+	reqBody := map[string]string{"type": "metaAndAssetCtxs"}
+	body, err := c.postInfo(reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []json.RawMessage
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }

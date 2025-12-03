@@ -2462,8 +2462,8 @@ function ExchangeConfigModal({
                         <div className="flex gap-2">
                           <input
                             type="text"
-                            value={maskSecret(apiKey)}
-                            readOnly
+                            value={apiKey}
+                            onChange={(e) => setApiKey(e.target.value)}
                             placeholder={t(
                               'enterHyperliquidAgentPrivateKey',
                               language
@@ -2475,34 +2475,6 @@ function ExchangeConfigModal({
                               color: '#EAECEF',
                             }}
                           />
-                          <button
-                            type="button"
-                            onClick={() => setSecureInputTarget('hyperliquid')}
-                            className="px-3 py-2 rounded text-xs font-semibold transition-all hover:scale-105"
-                            style={{
-                              background: '#F0B90B',
-                              color: '#000',
-                              whiteSpace: 'nowrap',
-                            }}
-                          >
-                            {apiKey
-                              ? t('secureInputReenter', language)
-                              : t('secureInputButton', language)}
-                          </button>
-                          {apiKey && (
-                            <button
-                              type="button"
-                              onClick={() => setApiKey('')}
-                              className="px-3 py-2 rounded text-xs font-semibold transition-all hover:scale-105"
-                              style={{
-                                background: '#1B1F2B',
-                                color: '#848E9C',
-                                whiteSpace: 'nowrap',
-                              }}
-                            >
-                              {t('secureInputClear', language)}
-                            </button>
-                          )}
                         </div>
                         {apiKey && (
                           <div className="text-xs" style={{ color: '#848E9C' }}>

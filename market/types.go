@@ -46,7 +46,7 @@ type LongerTermData struct {
 	RSI14Values   []float64
 }
 
-// Binance API 响应结构
+// Hyperliquid API 响应结构
 type ExchangeInfo struct {
 	Symbols []SymbolInfo `json:"symbols"`
 }

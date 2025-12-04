@@ -54,12 +54,13 @@ func (m *WSMonitor) Initialize(coins []string) error {
 		if err != nil {
 			return err
 		}
-		// 筛选永续合约交易对 --仅测试时使用
-		//exchangeInfo.Symbols = exchangeInfo.Symbols[0:2]
+		// 筛选永续合约交易对
 		for _, symbol := range exchangeInfo.Symbols {
-			if symbol.Status == "TRADING" && symbol.ContractType == "PERPETUAL" && strings.ToUpper(symbol.Symbol[len(symbol.Symbol)-4:]) == "USDT" {
-				m.symbols = append(m.symbols, symbol.Symbol)
-				m.filterSymbols.Store(symbol.Symbol, true)
+			if symbol.Status == "TRADING" && symbol.ContractType == "PERPETUAL" {
+				// Hyperliquid使用纯币种名称，存储时添加USDT后缀保持兼容
+				symbolWithSuffix := symbol.Symbol + "USDT"
+				m.symbols = append(m.symbols, symbolWithSuffix)
+				m.filterSymbols.Store(symbolWithSuffix, true)
 			}
 		}
 	} else {
@@ -169,11 +170,30 @@ func (m *WSMonitor) subscribeAll() error {
 
 func (m *WSMonitor) handleKlineData(symbol string, ch <-chan []byte, _time string) {
 	for data := range ch {
-		var klineData KlineWSData
-		if err := json.Unmarshal(data, &klineData); err != nil {
+		// Hyperliquid的candle数据格式
+		var hlCandle HyperliquidCandleWS
+		if err := json.Unmarshal(data, &hlCandle); err != nil {
 			log.Printf("解析Kline数据失败: %v", err)
 			continue
 		}
+
+		// 转换为KlineWSData格式
+		klineData := KlineWSData{
+			EventType: "kline",
+			EventTime: time.Now().UnixMilli(),
+			Symbol:    symbol,
+		}
+		klineData.Kline.StartTime = hlCandle.T
+		klineData.Kline.CloseTime = hlCandle.T2
+		klineData.Kline.Symbol = hlCandle.S
+		klineData.Kline.Interval = hlCandle.I
+		klineData.Kline.OpenPrice = hlCandle.O
+		klineData.Kline.ClosePrice = hlCandle.C
+		klineData.Kline.HighPrice = hlCandle.H
+		klineData.Kline.LowPrice = hlCandle.L
+		klineData.Kline.Volume = hlCandle.V
+		klineData.Kline.NumberOfTrades = hlCandle.N
+
 		m.processKlineUpdate(symbol, klineData, _time)
 	}
 }

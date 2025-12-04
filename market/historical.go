@@ -1,6 +1,7 @@
 package market
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,13 +10,13 @@ import (
 )
 
 const (
-	binanceFuturesKlinesURL = "https://fapi.binance.com/fapi/v1/klines"
-	binanceMaxKlineLimit    = 1500
+	hyperliquidInfoURL   = "https://api.hyperliquid.xyz/info"
+	hyperliquidMaxKlines = 5000 // Hyperliquid一次请求最多返回5000条
 )
 
 // GetKlinesRange 拉取指定时间范围内的 K 线序列（闭区间），返回按时间升序排列的数据。
 func GetKlinesRange(symbol string, timeframe string, start, end time.Time) ([]Kline, error) {
-	symbol = Normalize(symbol)
+	coin := NormalizeCoin(symbol)
 	normTF, err := NormalizeTimeframe(timeframe)
 	if err != nil {
 		return nil, err
@@ -33,18 +34,27 @@ func GetKlinesRange(symbol string, timeframe string, start, end time.Time) ([]Kl
 	client := &http.Client{Timeout: 15 * time.Second}
 
 	for cursor < endMs {
-		req, err := http.NewRequest("GET", binanceFuturesKlinesURL, nil)
+		// Hyperliquid使用POST请求
+		reqBody := map[string]interface{}{
+			"type": "candleSnapshot",
+			"req": map[string]interface{}{
+				"coin":      coin,
+				"interval":  normTF,
+				"startTime": cursor,
+				"endTime":   endMs,
+			},
+		}
+
+		jsonData, err := json.Marshal(reqBody)
 		if err != nil {
 			return nil, err
 		}
 
-		q := req.URL.Query()
-		q.Set("symbol", symbol)
-		q.Set("interval", normTF)
-		q.Set("limit", fmt.Sprintf("%d", binanceMaxKlineLimit))
-		q.Set("startTime", fmt.Sprintf("%d", cursor))
-		q.Set("endTime", fmt.Sprintf("%d", endMs))
-		req.URL.RawQuery = q.Encode()
+		req, err := http.NewRequest("POST", hyperliquidInfoURL, bytes.NewBuffer(jsonData))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -57,10 +67,10 @@ func GetKlinesRange(symbol string, timeframe string, start, end time.Time) ([]Kl
 			return nil, err
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("binance klines api returned status %d: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("hyperliquid klines api returned status %d: %s", resp.StatusCode, string(body))
 		}
 
-		var raw [][]interface{}
+		var raw []HyperliquidCandle
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return nil, err
 		}
@@ -70,23 +80,7 @@ func GetKlinesRange(symbol string, timeframe string, start, end time.Time) ([]Kl
 
 		batch := make([]Kline, len(raw))
 		for i, item := range raw {
-			openTime := int64(item[0].(float64))
-			open, _ := parseFloat(item[1])
-			high, _ := parseFloat(item[2])
-			low, _ := parseFloat(item[3])
-			close, _ := parseFloat(item[4])
-			volume, _ := parseFloat(item[5])
-			closeTime := int64(item[6].(float64))
-
-			batch[i] = Kline{
-				OpenTime:  openTime,
-				Open:      open,
-				High:      high,
-				Low:       low,
-				Close:     close,
-				Volume:    volume,
-				CloseTime: closeTime,
-			}
+			batch[i] = parseHyperliquidCandle(item)
 		}
 
 		all = append(all, batch...)
@@ -95,7 +89,7 @@ func GetKlinesRange(symbol string, timeframe string, start, end time.Time) ([]Kl
 		cursor = last.CloseTime + 1
 
 		// 若返回数量少于请求上限，说明已到达末尾，可提前退出。
-		if len(batch) < binanceMaxKlineLimit {
+		if len(batch) < hyperliquidMaxKlines {
 			break
 		}
 	}

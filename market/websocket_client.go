@@ -18,11 +18,13 @@ type WSClient struct {
 	done        chan struct{}
 }
 
+// WSMessage Hyperliquid WebSocket消息格式
 type WSMessage struct {
-	Stream string          `json:"stream"`
-	Data   json.RawMessage `json:"data"`
+	Channel string          `json:"channel"`
+	Data    json.RawMessage `json:"data"`
 }
 
+// KlineWSData K线WebSocket数据 - 适配Hyperliquid格式
 type KlineWSData struct {
 	EventType string `json:"e"`
 	EventTime int64  `json:"E"`
@@ -45,6 +47,20 @@ type KlineWSData struct {
 		TakerBuyBaseVolume  string `json:"V"`
 		TakerBuyQuoteVolume string `json:"Q"`
 	} `json:"k"`
+}
+
+// HyperliquidCandleWS Hyperliquid WebSocket K线数据
+type HyperliquidCandleWS struct {
+	T int64  `json:"t"` // 开盘时间
+	T2 int64 `json:"T"` // 收盘时间
+	S string `json:"s"` // 交易对
+	I string `json:"i"` // 时间间隔
+	O string `json:"o"` // 开盘价
+	C string `json:"c"` // 收盘价
+	H string `json:"h"` // 最高价
+	L string `json:"l"` // 最低价
+	V string `json:"v"` // 成交量
+	N int    `json:"n"` // 交易数量
 }
 
 type TickerWSData struct {
@@ -81,7 +97,8 @@ func (w *WSClient) Connect() error {
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	conn, _, err := dialer.Dial("wss://ws-fapi.binance.com/ws-fapi/v1", nil)
+	// Hyperliquid WebSocket端点
+	conn, _, err := dialer.Dial("wss://api.hyperliquid.xyz/ws", nil)
 	if err != nil {
 		return fmt.Errorf("WebSocket连接失败: %v", err)
 	}
@@ -99,25 +116,29 @@ func (w *WSClient) Connect() error {
 }
 
 func (w *WSClient) SubscribeKline(symbol, interval string) error {
-	stream := fmt.Sprintf("%s@kline_%s", symbol, interval)
-	return w.subscribe(stream)
+	// Hyperliquid使用coin名称(不带USDT)
+	coin := NormalizeCoin(symbol)
+	return w.subscribe(coin, "candle", interval)
 }
 
 func (w *WSClient) SubscribeTicker(symbol string) error {
-	stream := fmt.Sprintf("%s@ticker", symbol)
-	return w.subscribe(stream)
+	// Hyperliquid没有专门的ticker订阅，使用allMids
+	_ = symbol // 保留参数兼容性
+	return w.subscribeAllMids()
 }
 
 func (w *WSClient) SubscribeMiniTicker(symbol string) error {
-	stream := fmt.Sprintf("%s@miniTicker", symbol)
-	return w.subscribe(stream)
+	// Hyperliquid没有miniTicker，使用allMids代替
+	_ = symbol // 保留参数兼容性
+	return w.subscribeAllMids()
 }
 
-func (w *WSClient) subscribe(stream string) error {
+func (w *WSClient) subscribeAllMids() error {
 	subscribeMsg := map[string]interface{}{
-		"method": "SUBSCRIBE",
-		"params": []string{stream},
-		"id":     time.Now().Unix(),
+		"method": "subscribe",
+		"subscription": map[string]interface{}{
+			"type": "allMids",
+		},
 	}
 
 	w.mu.RLock()
@@ -132,7 +153,34 @@ func (w *WSClient) subscribe(stream string) error {
 		return err
 	}
 
-	log.Printf("订阅流: %s", stream)
+	log.Printf("订阅allMids流")
+	return nil
+}
+
+func (w *WSClient) subscribe(coin, subType, interval string) error {
+	// Hyperliquid订阅格式
+	subscribeMsg := map[string]interface{}{
+		"method": "subscribe",
+		"subscription": map[string]interface{}{
+			"type":     subType,
+			"coin":     coin,
+			"interval": interval,
+		},
+	}
+
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.conn == nil {
+		return fmt.Errorf("WebSocket未连接")
+	}
+
+	err := w.conn.WriteJSON(subscribeMsg)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("订阅流: %s %s %s", coin, subType, interval)
 	return nil
 }
 
@@ -170,15 +218,16 @@ func (w *WSClient) handleMessage(message []byte) {
 		return
 	}
 
+	// Hyperliquid使用channel字段而不是stream
 	w.mu.RLock()
-	ch, exists := w.subscribers[wsMsg.Stream]
+	ch, exists := w.subscribers[wsMsg.Channel]
 	w.mu.RUnlock()
 
 	if exists {
 		select {
 		case ch <- wsMsg.Data:
 		default:
-			log.Printf("订阅者通道已满: %s", wsMsg.Stream)
+			log.Printf("订阅者通道已满: %s", wsMsg.Channel)
 		}
 	}
 }

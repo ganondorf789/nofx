@@ -3,7 +3,6 @@ package market
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"strconv"
@@ -13,15 +12,24 @@ import (
 )
 
 // FundingRateCache 资金费率缓存结构
-// Binance Funding Rate 每 8 小时才更新一次，使用 1 小时缓存可显著减少 API 调用
+// Hyperliquid Funding Rate 每小时更新一次，使用 10 分钟缓存
 type FundingRateCache struct {
 	Rate      float64
 	UpdatedAt time.Time
 }
 
+// AssetCtxCache 资产上下文缓存（包含OI、资金费率等）
+type AssetCtxCache struct {
+	OpenInterest float64
+	Funding      float64
+	UpdatedAt    time.Time
+}
+
 var (
 	fundingRateMap sync.Map // map[string]*FundingRateCache
-	frCacheTTL     = 1 * time.Hour
+	assetCtxMap    sync.Map // map[string]*AssetCtxCache
+	frCacheTTL     = 10 * time.Minute
+	ctxCacheTTL    = 5 * time.Minute
 )
 
 // Get 获取指定代币的市场数据
@@ -322,90 +330,127 @@ func calculateLongerTermData(klines []Kline) *LongerTermData {
 	return data
 }
 
-// getOpenInterestData 获取OI数据
+// getOpenInterestData 获取OI数据 (从Hyperliquid metaAndAssetCtxs获取)
 func getOpenInterestData(symbol string) (*OIData, error) {
-	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/openInterest?symbol=%s", symbol)
+	coin := NormalizeCoin(symbol)
 
-	apiClient := NewAPIClient()
-	resp, err := apiClient.client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var result struct {
-		OpenInterest string `json:"openInterest"`
-		Symbol       string `json:"symbol"`
-		Time         int64  `json:"time"`
+	// 检查缓存
+	if cached, ok := assetCtxMap.Load(coin); ok {
+		cache := cached.(*AssetCtxCache)
+		if time.Since(cache.UpdatedAt) < ctxCacheTTL {
+			return &OIData{
+				Latest:  cache.OpenInterest,
+				Average: cache.OpenInterest * 0.999,
+			}, nil
+		}
 	}
 
-	if err := json.Unmarshal(body, &result); err != nil {
+	// 刷新资产上下文缓存
+	if err := refreshAssetCtxCache(); err != nil {
 		return nil, err
 	}
 
-	oi, _ := strconv.ParseFloat(result.OpenInterest, 64)
+	// 再次从缓存获取
+	if cached, ok := assetCtxMap.Load(coin); ok {
+		cache := cached.(*AssetCtxCache)
+		return &OIData{
+			Latest:  cache.OpenInterest,
+			Average: cache.OpenInterest * 0.999,
+		}, nil
+	}
 
-	return &OIData{
-		Latest:  oi,
-		Average: oi * 0.999, // 近似平均值
-	}, nil
+	return &OIData{Latest: 0, Average: 0}, nil
 }
 
-// getFundingRate 获取资金费率（优化：使用 1 小时缓存）
+// refreshAssetCtxCache 刷新资产上下文缓存
+func refreshAssetCtxCache() error {
+	apiClient := NewAPIClient()
+	result, err := apiClient.GetMetaAndAssetCtxs()
+	if err != nil {
+		return err
+	}
+
+	if len(result) < 2 {
+		return fmt.Errorf("无效的metaAndAssetCtxs响应")
+	}
+
+	// 解析meta获取资产名称列表
+	var meta struct {
+		Universe []struct {
+			Name string `json:"name"`
+		} `json:"universe"`
+	}
+	if err := json.Unmarshal(result[0], &meta); err != nil {
+		return err
+	}
+
+	// 解析assetCtxs
+	var assetCtxs []struct {
+		OpenInterest string `json:"openInterest"`
+		Funding      string `json:"funding"`
+	}
+	if err := json.Unmarshal(result[1], &assetCtxs); err != nil {
+		return err
+	}
+
+	// 更新缓存
+	now := time.Now()
+	for i, asset := range meta.Universe {
+		if i < len(assetCtxs) {
+			oi, _ := strconv.ParseFloat(assetCtxs[i].OpenInterest, 64)
+			funding, _ := strconv.ParseFloat(assetCtxs[i].Funding, 64)
+			assetCtxMap.Store(asset.Name, &AssetCtxCache{
+				OpenInterest: oi,
+				Funding:      funding,
+				UpdatedAt:    now,
+			})
+		}
+	}
+
+	return nil
+}
+
+// getFundingRate 获取资金费率（从缓存的资产上下文获取）
 func getFundingRate(symbol string) (float64, error) {
-	// 检查缓存（有效期 1 小时）
-	// Funding Rate 每 8 小时才更新，1 小时缓存非常合理
-	if cached, ok := fundingRateMap.Load(symbol); ok {
+	coin := NormalizeCoin(symbol)
+
+	// 检查缓存
+	if cached, ok := fundingRateMap.Load(coin); ok {
 		cache := cached.(*FundingRateCache)
 		if time.Since(cache.UpdatedAt) < frCacheTTL {
-			// 缓存命中，直接返回
 			return cache.Rate, nil
 		}
 	}
 
-	// 缓存过期或不存在，调用 API
-	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=%s", symbol)
-
-	apiClient := NewAPIClient()
-	resp, err := apiClient.client.Get(url)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
+	// 从assetCtxMap获取（如果已经刷新过）
+	if cached, ok := assetCtxMap.Load(coin); ok {
+		cache := cached.(*AssetCtxCache)
+		if time.Since(cache.UpdatedAt) < ctxCacheTTL {
+			// 更新fundingRateMap缓存
+			fundingRateMap.Store(coin, &FundingRateCache{
+				Rate:      cache.Funding,
+				UpdatedAt: time.Now(),
+			})
+			return cache.Funding, nil
+		}
 	}
 
-	var result struct {
-		Symbol          string `json:"symbol"`
-		MarkPrice       string `json:"markPrice"`
-		IndexPrice      string `json:"indexPrice"`
-		LastFundingRate string `json:"lastFundingRate"`
-		NextFundingTime int64  `json:"nextFundingTime"`
-		InterestRate    string `json:"interestRate"`
-		Time            int64  `json:"time"`
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
+	// 刷新资产上下文缓存
+	if err := refreshAssetCtxCache(); err != nil {
 		return 0, err
 	}
 
-	rate, _ := strconv.ParseFloat(result.LastFundingRate, 64)
+	// 再次从缓存获取
+	if cached, ok := assetCtxMap.Load(coin); ok {
+		cache := cached.(*AssetCtxCache)
+		fundingRateMap.Store(coin, &FundingRateCache{
+			Rate:      cache.Funding,
+			UpdatedAt: time.Now(),
+		})
+		return cache.Funding, nil
+	}
 
-	// 更新缓存
-	fundingRateMap.Store(symbol, &FundingRateCache{
-		Rate:      rate,
-		UpdatedAt: time.Now(),
-	})
-
-	return rate, nil
+	return 0, nil
 }
 
 // Format 格式化输出市场数据
